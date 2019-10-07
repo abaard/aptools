@@ -1,0 +1,299 @@
+#!/usr/bin/env perl
+
+# Copyright notice at end.
+
+use File::Basename;
+use Cwd;
+use FindBin qw($Bin);
+FindBin::again();
+BEGIN {
+  my %INC;
+  foreach my $dirname (@INC) {$INC{$dirname}++}
+  foreach my $dirname (dirname(__FILE__), $Bin, dirname($0), "/usr/local/scripts", "/usr/local/bin", getcwd()) {
+    next if ($INC{$dirname});
+    next unless (-d $dirname);
+    push(@INC, $dirname);
+    $INC{$dirname}++;
+} }
+
+require 'ap_common.pl';
+
+my $usage	= "usage: $0 [-num] [-ACEHINOPTUX] AP [AP [AP ...]]\n"
+		. "\tA: all options below\n"
+		. "\tC: channel info -- channel no, power level\n"
+		. "\tE: ethernet MAC\n"
+		. "\tH: hardware info -- AP model, serial#\n"
+ 		. "\tI: IP addr\n"
+		. "\tN: #clients\n"
+		. "\tO: only AP names (overrides other options)\n"
+		. "\tP: \"PoorSnrClients\" -- #clients with poor SNR\n"
+		. "\tT: TP info -- switch, port, bandwidth, duplex\n"
+		. "\tU: uptime -- total and CAPWAP\n"
+		. "\tX: Tx & Rx utilization, channelNo; AirQuality\n"
+		. "\tnum: max #APs to list, 0 for no limit\n";
+
+my $maxNofAPs	= $default{nofAPs};
+my $doListMAC	= $default{alwaysListMAC};
+my $doListWLC	= $default{alwaysListWLC};
+my $fieldSep	= $default{outputFieldSeparator};
+
+my $APnamesOnly	= $false;
+
+######################
+
+my %show;
+foreach my $opt (ALL,APtype,ethMAC,IP,NofClients,PoorSnrClients,RRMinfo,SerialNo,SwitchPort,Wired,Uptime,XUtil) {$show{$opt}=$false}	# not OnlyAPnames
+$show{NONE}	= $true;
+
+my $parm;
+while ($ARGV[0] =~ /^--?(\S+)$/) {
+  $parm = $1 unless ($parm);
+  if ($parm =~ /^\d+$/)		{$maxNofAPs		= $parm; shift; next}
+  $show{NONE} = $false if ($parm && ($parm !~ /^#/));
+  if    ($parm =~ /^A/i)	{foreach my $opt (keys %show) {$show{$opt}=$true}; $show{ALL}=$true}
+  elsif ($parm =~ /^C/i)	{$show{RRMinfo}		= $true}
+  elsif ($parm =~ /^E/i)	{$show{ethMAC}		= $true}
+  elsif ($parm =~ /^H/i)	{foreach my $opt (APtype,SerialNo) {$show{$opt}=$true}}
+  elsif ($parm =~ /^I/i)	{$show{IP}		= $true}
+  elsif ($parm =~ /^N/i)	{$show{NofClients}	= $true}
+  elsif ($parm =~ /^O/i)	{$show{OnlyAPnames}	= $true}
+  elsif ($parm =~ /^P/i)	{$show{PoorSnrClients}	= $true}
+  elsif ($parm =~ /^T/i)	{foreach my $opt (Wired,SwitchPort) {$show{$opt}=$true}}
+  elsif ($parm =~ /^U/i)	{$show{Uptime}		= $true}
+  elsif ($parm =~ /^X/i)	{$show{XUtil}		= $true}
+  elsif ($parm =~ /^#/)		{$fieldSep		= "#"}
+  elsif ($parm)			{die "\"$parm\"?\n$usage"}
+  if ($parm =~ /^.(.*)$/) {$parm=$1; redo}
+  shift;
+}
+if ($show{XUtil})		{$show{RRMinfo}=$true}		# AQ requires channel & extensionChannels
+if ($show{PoorSnrClients})	{$show{NofClients}=$true}
+
+die $usage unless ($ARGV[0]);
+
+######################
+
+sub lookupClientInfo {
+  my ($APMAC,$APOID) = @_;
+  my ($nofClients, $nofPoorSnrClients) = (0,0);
+  for (my $radioIx=0; $radioIx<$apData{$APMAC}{slots}; $radioIx++) {
+    my $OID = "AIRESPACE-WIRELESS-MIB::bsnApIfNoOfUsers.$APOID.$radioIx";
+    foreach my $output (snmpwalk($APMAC,$OID,0)) {
+      if ($output =~ /^\S+[ =]+[^:]+[: ]+(.*)$/) {
+        $nofClients += $1;
+    } }
+    if ($show{PoorSnrClients}) {
+      my $OID = "AIRESPACE-WIRELESS-MIB::bsnAPIfPoorSNRClients.$APOID.$radioIx";
+      foreach my $output (snmpwalk($APMAC,$OID)) {
+        if ($output =~ /^\S+[ =]+[^:]+[: ]+(.*)$/) {
+          $nofPoorSnrClients += $1;
+      } }
+    }
+  }
+  return($nofClients, $nofPoorSnrClients);
+}
+
+sub lookupSwitchInfo {
+# snmptable -c wlcmon -v 2c -Cb -Ci -Ob -m CISCO-LWAPP-CDP-MIB -M /Users/anders/txt/misc/CISCO-MIBs-20171207 ma-wlc5508.infra.uit.no clcCdpApCacheTable
+  my ($APMAC,$APOID) = @_;
+  my ($switchName,$switchPort);
+  my $OID = "CISCO-LWAPP-CDP-MIB::clcCdpApCacheNeighName.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID)) {
+    if ($output =~ /^\S+[ =]+[^:]+[: ]+(.*)$/) {
+      $switchName = $1;
+  } }
+  my $OID = "CISCO-LWAPP-CDP-MIB::clcCdpApCacheNeighInterface.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID)) {
+    if ($output =~ /^\S+[ =]+[^:]+[: ]+(.*)$/) {
+      $switchPort = $1;
+  } }
+  return($switchName,$switchPort);
+}
+
+sub lookupCableInfo {
+  my ($APMAC,$APOID) = @_;
+  my ($wireSpeed,$duplex,$PoEdrain);
+  my $OID = "CISCO-LWAPP-CDP-MIB::clcCdpApCacheInterfaceSpeed.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID)) {
+    if ($output =~ /^\S+[ =]+[^:]+[: ]+(.*)$/) {
+      $wireSpeed = $1;
+      if ($wireSpeed =~ /^([^\(]+)\(\d/) {$wireSpeed=$1}
+  } }
+  my $OID = "CISCO-LWAPP-CDP-MIB::clcCdpApCacheDuplex.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID)) {
+    if ($output =~ /^\S+[ =]+[^:]+[: ]+(.*)$/) {
+      $duplex = $1;
+      if ($duplex =~ /^([^\(]+)\(\d/) {$duplex=$1}
+  } }
+  my $OID = "CISCO-LWAPP-AP-MIB::cLApPowerStatus.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID)) {
+    if ($output =~ /^\S+[ =]+[^:]+[: ]+(.*)$/) {
+      $PoEdrain = $1;
+      if ($PoEdrain =~ /^([^\(]+)\(\d/) {$PoEdrain=$1}
+  } }
+  return($wireSpeed,$duplex,$PoEdrain);
+}
+
+my (@channel,@extensionChannels);
+sub lookupRRMinfo {
+  my ($APMAC,$APOID) = @_;
+  $#channel = $#extensionChannels = -1;
+  my (@operStatus,@powerLevel,@powerLevelList);
+  my $OID = "AIRESPACE-WIRELESS-MIB::bsnAPIfOperStatus.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID,0)) {
+    if ($output =~ /^(\S+)[ =]+[^:]+[: ]+(.*)$/) {
+      my ($OID,$operStatus) = ($1,$2);
+      if ($OID =~ /${APOID}\.(\d+)$/)		{$operStatus[$1] = $operStatus}
+  } }
+  my $OID = "AIRESPACE-WIRELESS-MIB::bsnAPIfPhyChannelNumber.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID)) {
+    if ($output =~ /^(\S+)[ =]+[^:]+[: ]+(.*)$/) {
+      my ($OID,$channel) = ($1,$2);
+      if ($channel =~ /^(ch\d+)\(\d+\)$/)	{$channel=$1}
+      if ($OID =~ /${APOID}\.(\d+)$/)		{$channel[$1] = $channel}
+  } }
+  my $OID = "AIRESPACE-WIRELESS-MIB::bsnAPIfPhyTxPowerLevel.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID)) {
+    if ($output =~ /^(\S+)[ =]+[^:]+[: ]+(.*)$/) {
+      my ($OID,$powerLevel) = ($1,$2);
+      if ($OID =~ /${APOID}\.(\d+)$/)		{$powerLevel[$1] = $powerLevel}
+  } }
+  my $OID = "CISCO-LWAPP-AP-MIB::cLApExtensionChannels.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID,0)) {
+    if ($output =~ /^(\S+)[ =]+[^:]+[: ]+(.*)$/) {
+      my ($OID,$extensionChannels) = ($1,$2);
+      if ($OID =~ /${APOID}\.(\d+)$/)		{$extensionChannels[$1] = $extensionChannels}
+  } }
+  $OID = "AIRESPACE-WIRELESS-MIB::bsnAPIfAbsolutePowerList.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID,0)) {
+    if ($output =~ /^\S+[ =]+[^:]+[: ]+(.*)$/) {
+      push(@powerLevelList,$1);
+  } }
+
+  my $result;
+  for ($slot=0; $slot<=$#channel; $slot++) {
+    $result .= "(";
+    if ($operStatus[$slot] =~ /down/) {$result .= "down)"}
+    else {
+      $result .= "$channel[$slot]";
+      if ($extensionChannels[$slot])		{$result .= ",$extensionChannels[$slot]"}
+      $result .= ":$powerLevel[$slot]=" . (split(/,/,$powerLevelList[$slot]))[$powerLevel[$slot]-1] . "dBm)";
+    }
+  }
+  return($result);
+}
+
+sub lookupUtilInfo {
+  my ($APMAC,$APOID) = @_;
+  my (@chanUtil, @txUtil, @rxUtil, %AQ);
+  my $OID = "AIRESPACE-WIRELESS-MIB::bsnAPIfLoadChannelUtilization.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID,0)) {
+    if ($output =~ /^(\S+)[ =]+[^:]+[: ]+(.*)$/) {
+      my ($OID,$chanUtil) = ($1,$2);
+      if ($OID =~ /${APOID}\.(\d+)$/)		{$chanUtil[$1] = $chanUtil}
+  } }
+  my $OID = "AIRESPACE-WIRELESS-MIB::bsnAPIfLoadTxUtilization.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID,0)) {
+    if ($output =~ /^(\S+)[ =]+[^:]+[: ]+(.*)$/) {
+      my ($OID,$txUtil) = ($1,$2);
+      if ($OID =~ /${APOID}\.(\d+)$/)		{$txUtil[$1] = $txUtil}
+  } }
+  my $OID = "AIRESPACE-WIRELESS-MIB::bsnAPIfLoadRxUtilization.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID,0)) {
+    if ($output =~ /^(\S+)[ =]+[^:]+[: ]+(.*)$/) {
+      my ($OID,$rxUtil) = ($1,$2);
+      if ($OID =~ /${APOID}\.(\d+)$/)		{$rxUtil[$1] = $rxUtil}
+  } }
+  my $OID = "CISCO-LWAPP-SI-MIB::cLSiAqIndex.$APOID";
+  foreach my $output (snmpwalk($APMAC,$OID,0)) {
+    if ($output =~ /^\S+\.(\d+)[ =]+[^:]+[: ]+(.*)$/) {
+      my ($ch,$aq) = ($1,$2);
+      $AQ{$ch} = $aq;
+  } }
+  my $result = "util\%,tx,rx:";
+  for ($slot=0; $slot<=$#chanUtil; $slot++) {
+    $result .= "($chanUtil[$slot],$txUtil[$slot],$rxUtil[$slot])";
+  }
+  $result .= ";AQ:";
+  for ($slot=0; $slot<=$#chanUtil; $slot++) {
+    my $chNum = (($channel[$slot] =~ /^(ch)?(\d+)$/) ? $2 : $channel[$slot]);
+    my @AQ = ($AQ{$chNum});
+    foreach my $ch (split(/,/,$extensionChannels[$slot])) {push(@AQ,$AQ{$ch})}
+    $result .= "(" . join(",",@AQ) . ")";
+  }
+  return($result);
+}
+
+sub lookupUptime {
+  my ($APMAC,$APOID) = @_;
+  my $upTime       = snmpget($APMAC,"CISCO-LWAPP-AP-MIB::cLApUpTime.$APOID",0);		# time in hundredths of a second
+  my $lWAPPupTime  = snmpget($APMAC,"CISCO-LWAPP-AP-MIB::cLLwappUpTime.$APOID",0);
+  my $rebootReason = snmpget($APMAC,"CISCO-LWAPP-AP-MIB::cLApLastRebootReason.$APOID",0);
+  if ($upTime       =~ /^\((\d+)\)/)    {$upTime       = sec2timeStamp($1/100)}
+  if ($lWAPPupTime  =~ /^\((\d+)\)/)    {$lWAPPupTime  = sec2timeStamp($1/100)}
+  if ($rebootReason =~ /^(.*)\(\d+\)$/) {$rebootReason = $1}
+  return("up=$upTime,LWAPP=$lWAPPupTime,lastReboot=$rebootReason");
+}
+
+######################
+
+my $prefixSearch = $false;
+if ($ARGV[0] =~ /^WLC$/i) {
+  my %nofAPs;
+  lookupAPinfo("rw", 0);
+  foreach my $APmac (keys %apData) {$nofAPs{$apData{$APmac}{wlc}}++}
+  foreach my $WLC (sort {$nofAPs{$b}<=>$nofAPs{$a}} keys %nofAPs) {print "$WLC\n"}
+} else {
+  if ($ARGV[0] =~ /^\^(.+)$/) {$ARGV[0] = $1; $prefixSearch = $true}
+  my $searchPattern = "(" . join("|",@ARGV) . ")";
+  lookupAPinfo($searchPattern, $maxNofAPs);
+  foreach my $APmac (sort {$apData{$a}{name} cmp $apData{$b}{name}} keys %apData) {
+    next if ($prefixSearch && ($apData{$APmac}{name} !~ /^$searchPattern/));
+    if ($show{OnlyAPnames}) {print "$apData{$APmac}{name}\n"; next}
+    my $result = join("$fieldSep", $apData{$APmac}{name}, $apData{$APmac}{slots})
+		. (($doListMAC || $show{ALL} || $show{NONE}) ? "$fieldSep${APmac}" : "")
+		. (($doListWLC || $show{ALL} || $show{NONE}) ? "$fieldSep$apData{$APmac}{wlc}" : "");
+    if ($show{ethMAC})	{$result .= "$fieldSep$apData{$APmac}{eth}"}
+    if ($show{IP})	{$result .= "$fieldSep$apData{$APmac}{ip}"}
+    my $APOID = convertTo($APmac, "OID");
+    if ($show{NofClients}) {
+      my ($nofClients, $nofPoorSnrClients) = lookupClientInfo($APmac,$APOID);
+      $result .= "$fieldSep$nofClients" . (($show{PoorSnrClients}) ? "$fieldSep$nofPoorSnrClients" : "");
+    }
+    if ($show{RRMinfo})		{$result .= "$fieldSep" . lookupRRMinfo($APmac,$APOID)}
+    if ($show{XUtil})		{$result .= "$fieldSep" . lookupUtilInfo($APmac,$APOID)}
+    if ($show{Uptime})		{$result .= "$fieldSep" . lookupUptime($APmac,$APOID)}
+    if ($show{SwitchPort}) {
+      my ($switchName,$switchPort) = lookupSwitchInfo($APmac,$APOID);
+      $result .= "$fieldSep$switchName,$switchPort";
+    }
+    if ($show{Wired}) {
+      my ($wireSpeed,$duplex,$PoEdrain) = lookupCableInfo($APmac,$APOID);
+      $result .= "$fieldSep$wireSpeed,$duplex,PoE=$PoEdrain";
+    }
+    if ($show{APtype})		{$result .= "$fieldSep$apData{$APmac}{type}"}
+    if ($show{SerialNo})	{$result .= "$fieldSep$apData{$APmac}{serial}"}
+    print "$result\n";
+    $matchNo++;
+    if ($maxNofAPs && ($matchNo >= $maxNofAPs) && (scalar(keys %apData) > $maxNofAPs)) {
+      print "(truncated)\n";
+      last;
+} } }
+
+__END__
+
+This program is part of the AP tools software, Copyright 2019 Anders Baardsgaard, <anders.baardsgaard@uit.no>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+

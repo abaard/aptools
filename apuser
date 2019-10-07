@@ -1,0 +1,277 @@
+#!/usr/bin/env perl
+
+# Copyright notice at end.
+    
+use DB_File;
+use File::Basename;
+use Cwd;
+use FindBin qw($Bin);
+FindBin::again();
+BEGIN {
+  my %INC;
+  foreach my $dirname (@INC) {$INC{$dirname}++}
+  foreach my $dirname (dirname(__FILE__), $Bin, dirname($0), "/usr/local/scripts", "/usr/local/bin", getcwd()) {
+    next if ($INC{$dirname});
+    next unless (-d $dirname);
+    push(@INC, $dirname);
+    $INC{$dirname}++;
+} }
+    
+require 'ap_common.pl';
+
+my $usage = "usage: $0 [-abdirstu] UIDorMAC [UIDorMAC [...]]\n"
+	. "\ta: all options below\n"
+	. "\tb: Bitrate/MCS, SS, PHY\n"
+	. "\td: Duplicates\n"
+	. "\ti: IP addr\n"
+	. "\tr: Retries\n"
+	. "\ts: Scramble (toggle)\n"
+	. "\tt: Type\n"
+	. "\tu: Uptime\n";
+
+my $doScrambleUID	= $default{scrambleUserNames};
+my $doScrambleMAC	= $default{scrambleMACaddrs};
+my $fieldSep		= $default{outputFieldSeparator};
+my $doCompressCol	= $default{compressColumns};
+my $tickLimit		= $default{userCountTickLimit};
+
+#debug{get}	= $false;
+#debug{walk}	= $false;
+
+######################
+  
+my %show, $scrambleReversed;
+foreach my $opt (ALL,bitrate,duplicat,ipaddr,retries,type,uptime) {$show{$opt}=$false}
+$show{NONE}	= $true;
+
+my $parm;
+while ($ARGV[0] =~ /^--?(\S+)$/) {
+  $parm = $1 unless ($parm);
+  $show{NONE} = $false if ($parm && $parm !~ /^[s#]/);
+  if    ($parm =~ /^a(.*)/)	{$parm = "bdirtu$1"; redo}
+  elsif ($parm =~ /^b/)		{$show{bitrate}	= $true}
+  elsif ($parm =~ /^d/)		{$show{duplicat}= $true}
+  elsif ($parm =~ /^i/)		{$show{ipaddr}	= $true}
+  elsif ($parm =~ /^r/)		{$show{retries}	= $true}
+  elsif ($parm =~ /^s/)		{$doScrambleUID	= !$doScrambleUID;
+				 $doScrambleMAC	= !$doScrambleMAC;
+				 $scrambleReversed = $true}
+  elsif ($parm =~ /^[th]/)	{$show{type}	= $true}		# type/hardware
+  elsif ($parm =~ /^u/)		{$show{uptime}	= $true}
+  elsif ($parm =~ /^#/)		{$fieldSep      = "#"}
+  elsif ($parm)			{die "\"$parm\"?\n$usage"}
+  if ($parm =~ /^.(.*)$/)	{$parm=$1; redo}
+  shift;
+}
+if ($show{NONE}) {$doCompressCol = $false}
+
+die $usage if ($#ARGV < 0);
+
+######################
+
+my %wlcCount, %macMap;
+%uidScramble, %macScramble;
+if ($show{type}) {dbmopen(%macMap, $OUIdb, 0444) || warn "unable to open OUI db, $OUIdb; $!\n"}
+lookupAPinfo("rw",0);
+foreach my $apMac (keys %apData) {$wlcCount{$apData{$apMac}{wlc}}++}
+
+if ($doScrambleUID || $doScrambleMAC) {initScrambleDir()}
+if ($doScrambleUID || $scrambleReversed) {dbmopen(%uidScramble, $scrambleUIDdb, $scrambleFMode) || die "unable to open scrambled UIDs db, $scrambleUIDdb; $!\n"}
+if ($doScrambleMAC || $scrambleReversed) {dbmopen(%macScramble, $scrambleMACdb, $scrambleFMode) || die "unable to open scrambled MACs db, $scrambleMACdb; $!\n"}
+
+my @clientMAC, %SSID, %userID, %WLCassoc, %seen;
+foreach my $userOrClient (@ARGV) {
+  if (($doScrambleUID || $scrambleReversed) && ($userOrClient =~ /^U-\d+$/))					{$userOrClient = descramble($userOrClient)}
+  if (($doScrambleMAC || $scrambleReversed) && ($userOrClient =~ /^(([\da-f]{2}:){3})(xx(:[\da-f]{2}){2})$/))	{$userOrClient = $1 . descramble($3)}
+  if (   ($userOrClient =~ /^([\da-f]{1,2}[-:]){5}[\da-f]{1,2}$/i)
+      || ($userOrClient =~ /^[\da-f]{4}\.[\da-f]{4}\.[\da-f]{4}$/i)
+      || ($userOrClient =~ /^[\da-f]{12}$/i)) {					# parameter is clientMAC; find SSID
+    my $clientMAC = convertTo($userOrClient, "MAC");
+    my $clientOID = convertTo($clientMAC, "OID");
+    my $OID = "AIRESPACE-WIRELESS-MIB::bsnMobileStationSsid.$clientOID";
+    if ($clientMAC != $userOrClient) {print "($userOrClient -> $clientMAC)\n"}
+    foreach my $WLC (keys %wlcCount) {
+      foreach my $output (snmpwalk($WLC,$OID,0)) {
+        if ($output =~ /^\S+ = \w+: (.+)$/) {
+          ($SSID{$clientMAC},$WLCassoc{$clientMAC}) = ($1,$WLC);
+          last;
+      } }
+      if ($SSID{$clientMAC} && !$seen{MAC}{$clientMAC}) {
+        push(@clientMAC, $clientMAC);
+        $seen{MAC}{$clientMAC}++;
+        if    (scalar(keys %{$seen{MAC}}) == $tickLimit) {print "clients: " . "." x $tickLimit}
+        elsif (scalar(keys %{$seen{MAC}}) >  $tickLimit) {print "."}
+        last;
+    } }
+  } else {									# parameter is userID; find devices
+    my ($userID,$userOID) = ($userOrClient,convertTo($userOrClient,"OID"));
+    my $OID = "AIRESPACE-WIRELESS-MIB::bsnMobileStationByUserMacAddress." . length($userID) . ".$userOID";
+    foreach my $WLC (keys %wlcCount) {
+      foreach my $output (snmpwalk($WLC,$OID,0)) {
+        if ($output =~ /^\S+ = \w+: (.+)$/) {
+          my $clientMAC = convertTo($1, "MAC");
+          next if ($seen{MAC}{$clientMAC});
+          push(@clientMAC, $clientMAC);
+          $seen{MAC}{$clientMAC}++;
+          $userID{$clientMAC} = $userID;
+          $WLCassoc{$clientMAC} = $WLC;
+          if    (scalar(keys %{$seen{MAC}}) == $tickLimit) {print "clients: " . "." x $tickLimit}
+          elsif (scalar(keys %{$seen{MAC}}) >  $tickLimit) {print "."}
+} } } } }
+if (scalar(keys %{$seen{MAC}}) >= $tickLimit) {print " ("}
+
+######################
+
+my %maxLen;
+my %fieldLen = (
+	RSSISNR		=> 14,
+	MCSSSPHY	=> 18,
+	vendor		=> 17,
+	upTime		=> 13,
+	ipAddr		=> 15,
+);
+{
+  for (my $i=0; $i<=$#clientMAC; $i++) {		# (1) collect enough data to estimate field sizes
+    my ($WLC, $clientOID) = ($WLCassoc{$clientMAC[$i]}, convertTo($clientMAC[$i], "OID"));
+    $user[$i] = $userID{$clientMAC[$i]};
+    $user[$i] = snmpget($WLC,"AIRESPACE-WIRELESS-MIB::bsnMobileStationUserName.$clientOID",0) if (!$user[$i]);
+    if ($doScrambleUID && $user[$i]) {$user[$i] = scramble($user[$i])}
+    $seen{user}{$user[$i]}++;
+    my $APMAC = snmpget($WLC,"AIRESPACE-WIRELESS-MIB::bsnMobileStationAPMacAddr.$clientOID",0);
+    my $APOID = convertTo($APMAC,"OID");
+    $APname[$i] = snmpget($WLC,"AIRESPACE-WIRELESS-MIB::bsnAPName.$APOID",0);
+    if ($APname[$i] =~ /^"([^"]+)"$/) {$APname[$i] = $1}
+    $seen{APname}{$APname[$i]}++;
+    $SSID[$i] = $SSID{$clientMAC[$i]};
+    $SSID[$i] = snmpget($WLC,"AIRESPACE-WIRELESS-MIB::bsnMobileStationSsid.$clientOID",0) if (!$SSID[$i]);
+    $seen{SSID}{$SSID[$i]}++;
+    if ($show{bitrate}) {
+      $clientPHYtype[$i] = snmpget($WLC,"CISCO-LWAPP-DOT11-CLIENT-MIB::cldcClientProtocol.$clientOID",0);
+      $clientPHYtype[$i] = $1 if ($clientPHYtype[$i] =~ /^([^\(]+)\(\d+\)$/);
+      $seen{PHY}{$clientPHYtype[$i]}++;
+    }
+    if ($show{type}) {
+      $type[$i] = snmpget($WLC,"CISCO-LWAPP-DOT11-CLIENT-MIB::cldcClientDeviceType.$clientOID",0);
+      if ($clientMAC[$i] =~ /^(..:..:..)/) {($OUI=$1)=~tr/a-f/A-F/}
+      $vendor[$i] = (($macMap{$OUI}=~/^(.*)$/) ? $1 : "");
+      if (length($vendor[$i]) > $fieldLen{vendor}) {$vendor[$i] = substr($vendor[$i],0,$fieldLen{vendor})}
+    }
+    if ($show{retries}) {
+      $txPkt[$i] = snmpget($WLC,"CISCO-LWAPP-DOT11-CLIENT-MIB::cldcClientTxDataPackets.$clientOID",0);
+    }
+    if ($show{duplicat}) {
+      $rxPkt[$i] = snmpget($WLC,"CISCO-LWAPP-DOT11-CLIENT-MIB::cldcClientRxDataPackets.$clientOID",0);
+    }
+    if (length($user[  $i]) > $maxLen{user})   {$maxLen{user}   = length($user[  $i])}
+    if (length($APname[$i]) > $maxLen{APname}) {$maxLen{APname} = length($APname[$i])}
+    if (length($SSID[  $i]) > $maxLen{SSID})   {$maxLen{SSID}   = length($SSID[  $i])}
+    if (length($vendor[$i]) > $maxLen{vendor}) {$maxLen{vendor} = length($vendor[$i])}
+    if (length($type[  $i]) > $maxLen{type})   {$maxLen{type}   = length($type[  $i])}
+    if (length($txPkt[ $i]) > $maxLen{txPkt})  {$maxLen{txPkt}  = length($txPkt[ $i])}
+    if (length($rxPkt[ $i]) > $maxLen{rxPkt})  {$maxLen{rxPkt}  = length($rxPkt[ $i])}
+    if (scalar(keys %{$seen{MAC}}) >= $tickLimit) {print "."}
+  }
+  if (scalar(keys %{$seen{MAC}}) >= $tickLimit) {print ")\n"}
+  if ($doCompressCol && (scalar(keys %{$seen{PHY}})) < 2) {$fieldLen{MCSSSPHY} -= 9}
+
+  for (my $i=0; $i<=$#clientMAC; $i++) {		# (2) collect rest of data, and output
+    my ($WLC, $clientOID) = ($WLCassoc{$clientMAC[$i]}, convertTo($clientMAC[$i], "OID"));
+    my ($RSSI,$SNR);
+    $RSSI = snmpget($WLC,"AIRESPACE-WIRELESS-MIB::bsnMobileStationRSSI.$clientOID",0);
+    $SNR  = snmpget($WLC,"AIRESPACE-WIRELESS-MIB::bsnMobileStationSnr.$clientOID",0);
+    my $signalStr = "(${RSSI}dBm/${SNR}dB)";
+    if ($doScrambleMAC) {
+      my $OUIpart	= join(":",(split(/:/,$clientMAC[$i]))[0..2]);
+      my $clientPart	= join(":",(split(/:/,$clientMAC[$i]))[3..5]);
+      $clientMAC[$i]	= join(":",$OUIpart,scramble($clientPart));
+    }
+    print "$clientMAC[$i]  ";
+    if ($doCompressCol) {
+      if (scalar(keys %{$seen{user}})   > 1) {print $user[$i]   . " " x ($maxLen{user}	-length($user[$i]))		. "$fieldSep"}
+      if (scalar(keys %{$seen{APname}}) > 1) {print $APname[$i] . " " x ($maxLen{APname}	-length($APname[$i]))	. "$fieldSep"}
+      if (scalar(keys %{$seen{SSID}})   > 1) {print $SSID[$i]   . " " x ($maxLen{SSID}	-length($SSID[$i]))		. "$fieldSep"}
+    } else {
+      print $user[$i]   . " " x ($maxLen{user}	-length($user[$i]))		. "$fieldSep";
+      print $APname[$i] . " " x ($maxLen{APname}	-length($APname[$i]))	. "$fieldSep";
+      print $SSID[$i]   . " " x ($maxLen{SSID}	-length($SSID[$i]))		. "$fieldSep";
+    }
+    print $signalStr	. " " x ($fieldLen{RSSISNR}	-length($signalStr))	. "$fieldSep";
+    if ($show{bitrate}) {							# (m8,ss2)	dot11ac5
+      my ($clientTxRateSet, $clientPHYtype);
+      $clientTxRateSet = snmpget($WLC,"CISCO-LWAPP-DOT11-CLIENT-MIB::cldcClientCurrentTxRateSet.$clientOID",0);
+      $clientTxRateSet = "($1,$3)" if ($clientTxRateSet =~ /^"(m\d+)(\s+(ss\d+))?" Mbit\/s$/);
+      $clientTxRateSet =~ s/Mbit\/s/Mbps/;
+      my $rateStr = $clientTxRateSet . " " x (9-length($clientTxRateSet))
+		. ((scalar(keys %{$seen{PHY}}) > 1) ? " $clientPHYtype" : "");
+      print $rateStr	. " " x ($fieldLen{MCSSSPHY}	-length($rateStr))	. "$fieldSep";
+    }
+    if ($show{type}) {								# "Apple"	iPhone 8
+      print ""
+	. $type[$i]	. " " x ($maxLen{type}	-length($type[$i]))		. "$fieldSep"
+	. $vendor[$i]	. " " x ($maxLen{vendor}	-length($vendor[$i]))	. "$fieldSep";
+    }
+    if ($show{uptime}) {							# Up=1+07:16:13
+      my $clientUpTime = snmpget($WLC,"CISCO-LWAPP-DOT11-CLIENT-MIB::cldcClientUpTime.$clientOID",0);
+      my $uptimeStr = "Up=" . sec2timeStamp($clientUpTime);
+      print $uptimeStr	. " " x ($fieldLen{upTime}	-length($uptimeStr))	. "$fieldSep";
+    }
+    if ($show{ipaddr}) {							# 129.242.112.158
+      $clientIP = snmpget($WLC,"AIRESPACE-WIRELESS-MIB::bsnMobileStationIpAddress.$clientOID",0);
+      print $clientIP	. " " x ($fieldLen{ipAddr}	-length($clientIP))	. "$fieldSep";
+    }
+    if ($show{retries}) {							# Retry:729911/27321409 (2.6%)
+      my ($clientDataRetries,$clientRTSRetries);
+      $clientDataRetries = snmpget($WLC,"CISCO-LWAPP-DOT11-CLIENT-MIB::cldcClientDataRetries.$clientOID",0);
+#?    $clientRTSRetries  = snmpget($WLC,"CISCO-LWAPP-DOT11-CLIENT-MIB::cldcClientRtsRetries.$clientOID",0);
+      if ($clientDataRetries =~ /^(\d+) Retries$/) {$clientDataRetries = $1}
+#?    if ($clientRTSRetries  =~ /^(\d+) Retries$/) {$clientRTSRetries  = $1}
+      my $retryStr = "Retry:$clientDataRetries/$txPkt[$i]"
+	. ((($txPkt[$i]+$clientDataRetries) > 0)
+		? " (" . int($clientDataRetries*1000/($txPkt[$i]+$clientDataRetries))/10 . "%)"
+		: "");
+      print $retryStr . " " x ($maxLen{txPkt}*2 +8+6 -length($retryStr))	. "$fieldSep";
+    }
+    if ($show{duplicat}) {							# Dup:9896/33725834 (0%)
+      my ($clientDupPackets);
+      $clientDupPackets = snmpget($WLC,"CISCO-LWAPP-DOT11-CLIENT-MIB::cldcClientDuplicatePackets.$clientOID",0);
+      if ($clientDupPackets =~ /^(\d+) Packets?$/) {$clientDupPackets = $1}
+      my $dupStr = "Dup:$clientDupPackets/$rxPkt[$i]"
+	. ((($rxPkt[$i]+$clientDupPackets) > 0)
+		? " (" . int($clientDupPackets*1000/($rxPkt[$i]+$clientDupPackets))/10 . "%)"
+		: "");
+      print $dupStr;
+    }
+    print "\n";
+} }
+
+my $extraNewline = $false;
+if ($doCompressCol && (scalar(keys %{$seen{APname}}) > 0)) {
+  if  (scalar(keys %{$seen{user}})   < 2)  {print "user=" . join("",keys %{$seen{user}})   ."; "; $extraNewline=$true}
+  if  (scalar(keys %{$seen{APname}}) < 2)  {print "AP="   . join("",keys %{$seen{APname}}) ."; "; $extraNewline=$true}
+  if  (scalar(keys %{$seen{SSID}})   < 2)  {print "SSID=" . join("",keys %{$seen{SSID}})   ."; "; $extraNewline=$true}
+  if ((scalar(keys %{$seen{PHY}})    < 2) &&
+      (scalar(keys %{$seen{PHY}})    > 0)) {print "PHY="  . join("",keys %{$seen{PHY}})    ."; "; $extraNewline=$true}
+}
+if ($extraNewline) {print "\n"}
+
+if ($show{type}) {dbmclose(%macMap)}
+if ($doScrambleUID || $scrambleReversed) {dbmclose(%uidScramble)}
+if ($doScrambleMAC || $scrambleReversed) {dbmclose(%macScramble)}
+
+__END__
+
+This program is part of the AP tools software, Copyright 2019 Anders Baardsgaard, <anders.baardsgaard@uit.no>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+    
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+      
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
